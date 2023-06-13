@@ -11,11 +11,13 @@ import os
 import time
 import argparse
 import json
+import glob
 
 import numpy as np
 import torch
 import nvdiffrast.torch as dr
 import xatlas
+import open3d as o3d
 
 # Import data readers / generators
 from dataset.dataset_mesh import DatasetMesh
@@ -146,11 +148,16 @@ def initial_guess_material(geometry, mlp, FLAGS, init_mat=None):
         # Setup Kd (albedo) and Ks (x, roughness, metalness) textures
         if FLAGS.random_textures or init_mat is None:
             num_channels = 4 if FLAGS.layers > 1 else 3
-            kd_init = torch.rand(size=FLAGS.texture_res + [num_channels], device='cuda') * (kd_max - kd_min)[None, None, 0:num_channels] + kd_min[None, None, 0:num_channels]
+            # kd_init = torch.rand(size=FLAGS.texture_res + [num_channels], device='cuda') * (kd_max - kd_min)[None, None, 0:num_channels] + kd_min[None, None, 0:num_channels]
+            # 0.5 init for albedo
+            kd_init = np.random.uniform(size=FLAGS.texture_res + [num_channels], low=torch.tensor(0.5, dtype=torch.float32), high=torch.tensor(0.5, dtype=torch.float32))
+            kd_init = torch.from_numpy(kd_init).to(device='cuda').to(torch.float32)
             kd_map_opt = texture.create_trainable(kd_init , FLAGS.texture_res, not FLAGS.custom_mip, [kd_min, kd_max])
 
             ksR = np.random.uniform(size=FLAGS.texture_res + [1], low=0.0, high=0.01)
-            ksG = np.random.uniform(size=FLAGS.texture_res + [1], low=ks_min[1].cpu(), high=ks_max[1].cpu())
+            # ksG = np.random.uniform(size=FLAGS.texture_res + [1], low=ks_min[1].cpu(), high=ks_max[1].cpu())
+            # 0.5 init for roughness
+            ksG = np.random.uniform(size=FLAGS.texture_res + [1], low=torch.tensor(0.5, dtype=torch.float32), high=torch.tensor(0.5, dtype=torch.float32))
             ksB = np.random.uniform(size=FLAGS.texture_res + [1], low=ks_min[2].cpu(), high=ks_max[2].cpu())
 
             ks_map_opt = texture.create_trainable(np.concatenate((ksR, ksG, ksB), axis=2), FLAGS.texture_res, not FLAGS.custom_mip, [ks_min, ks_max])
@@ -161,6 +168,7 @@ def initial_guess_material(geometry, mlp, FLAGS, init_mat=None):
         # Setup normal map
         if FLAGS.random_textures or init_mat is None or 'normal' not in init_mat:
             normal_map_opt = texture.create_trainable(np.array([0, 0, 1]), FLAGS.texture_res, not FLAGS.custom_mip, [nrm_min, nrm_max])
+            # normal_map_opt = texture.create_trainable(np.array([0, 0, 1]), FLAGS.texture_res, False, [nrm_min, nrm_max])
         else:
             normal_map_opt = texture.create_trainable(init_mat['normal'], FLAGS.texture_res, not FLAGS.custom_mip, [nrm_min, nrm_max])
 
@@ -174,6 +182,7 @@ def initial_guess_material(geometry, mlp, FLAGS, init_mat=None):
         mat['bsdf'] = init_mat['bsdf']
     else:
         mat['bsdf'] = 'pbr'
+        # mat['bsdf'] = 'diffuse'
 
     return mat
 
@@ -192,6 +201,7 @@ def validate_itr(glctx, target, geometry, opt_material, lgt, FLAGS):
 
         result_dict['ref'] = util.rgb_to_srgb(target['img'][...,0:3])[0]
         result_dict['opt'] = util.rgb_to_srgb(buffers['shaded'][...,0:3])[0]
+        result_dict['opt_hdr'] = buffers['shaded'][..., 0:3][0]
         result_image = torch.cat([result_dict['opt'], result_dict['ref']], axis=1)
 
         if FLAGS.display is not None:
@@ -219,7 +229,7 @@ def validate_itr(glctx, target, geometry, opt_material, lgt, FLAGS):
    
         return result_image, result_dict
 
-def validate(glctx, geometry, opt_material, lgt, dataset_validate, out_dir, FLAGS):
+def validate(glctx, geometry, opt_material, lgt, dataset_validate, out_dir, FLAGS, val_envmaps=[]):
 
     # ==============================================================================================
     #  Validation loop
@@ -239,7 +249,12 @@ def validate(glctx, geometry, opt_material, lgt, dataset_validate, out_dir, FLAG
             # Mix validation background
             target = prepare_batch(target, FLAGS.background)
 
-            result_image, result_dict = validate_itr(glctx, target, geometry, opt_material, lgt, FLAGS)
+            if not FLAGS.nvs:
+                lgt_val = light.load_env(val_envmaps[it])
+                print(f"Using envmap : {val_envmaps[it]}")
+                result_image, result_dict = validate_itr(glctx, target, geometry, opt_material, lgt_val, FLAGS)
+            else:
+                result_image, result_dict = validate_itr(glctx, target, geometry, opt_material, lgt, FLAGS)
            
             # Compute metrics
             opt = torch.clamp(result_dict['opt'], 0.0, 1.0) 
@@ -254,8 +269,18 @@ def validate(glctx, geometry, opt_material, lgt, dataset_validate, out_dir, FLAG
             fout.write(str(line))
 
             for k in result_dict.keys():
-                np_img = result_dict[k].detach().cpu().numpy()
-                util.save_image(out_dir + '/' + ('val_%06d_%s.png' % (it, k)), np_img)
+                if 'opt_hdr' in k:
+                    np_img = result_dict[k].detach().cpu().numpy()
+                    if FLAGS.nvs:
+                        np.save(out_dir + '/' + ('nvs_val_%06d_%s.npy' % (it, k)), np_img)
+                    else:
+                        np.save(out_dir + '/' + ('relight_val_%06d_%s.npy' % (it, k)), np_img)
+                else:
+                    np_img = result_dict[k].detach().cpu().numpy()
+                    if FLAGS.nvs:
+                        util.save_image(out_dir + '/' + ('nvs_val_%06d_%s.png' % (it, k)), np_img)
+                    else:
+                        util.save_image(out_dir + '/' + ('relight_val_%06d_%s.png' % (it, k)), np_img)
 
         avg_mse = np.mean(np.array(mse_values))
         avg_psnr = np.mean(np.array(psnr_values))
@@ -492,15 +517,20 @@ if __name__ == "__main__":
     parser.add_argument('-bg', '--background', default='checker', choices=['black', 'white', 'checker', 'reference'])
     parser.add_argument('--loss', default='logl1', choices=['logl1', 'logl2', 'mse', 'smape', 'relmse'])
     parser.add_argument('-o', '--out-dir', type=str, default=None)
-    parser.add_argument('-rm', '--ref_mesh', type=str)
+    # parser.add_argument('-rm', '--ref_mesh', type=str)
     parser.add_argument('-bm', '--base-mesh', type=str, default=None)
     parser.add_argument('--validate', type=bool, default=True)
-    
+    parser.add_argument('--ref_mesh', type=str, required=True)
+    parser.add_argument('--nvs', type=str, default=True)
+    parser.add_argument('--out_dir', type=str, required=True)
+    parser.add_argument('--envmap_dir', type=str, default=None)
+    parser.add_argument('--bbox', type=str, required=True)
+
     FLAGS = parser.parse_args()
 
     FLAGS.mtl_override        = None                     # Override material of model
     FLAGS.dmtet_grid          = 64                       # Resolution of initial tet grid. We provide 64 and 128 resolution grids. Other resolutions can be generated with https://github.com/crawforddoran/quartet
-    FLAGS.mesh_scale          = 2.1                      # Scale of tet grid box. Adjust to cover the model
+    # FLAGS.mesh_scale          = 2.1                      # Scale of tet grid box. Adjust to cover the model
     FLAGS.env_scale           = 1.0                      # Env map intensity multiplier
     FLAGS.envmap              = None                     # HDR environment probe
     FLAGS.display             = None                     # Conf validation window/display. E.g. [{"relight" : <path to envlight>}]
@@ -520,6 +550,27 @@ if __name__ == "__main__":
     FLAGS.cam_near_far        = [0.1, 1000.0]
     FLAGS.learn_light         = True
 
+    FLAGS.iter                = 5000                     # Number of iterations
+    FLAGS.batch               = 8                        # Batch size
+    FLAGS.random_texture      = True                    # Randomize texture
+    FLAGS.save_interval        = 100                     # Save interval
+    FLAGS.learning_rate       = [0.03, 0.01]                     # Learning rate
+    FLAGS.ks_min             = [0.0, 0.08, 0.0]          # Min ks
+    FLAGS.dmtet_grid          = 128                       # Resolution of initial tet grid. We provide 64 and 128 resolution grids. Other resolutions can be generated with
+    FLAGS.laplace_scale       = 3000.0                  # Weight for sdf regularizer. Default is relative with large weight
+    FLAGS.display            = [{"latlong" : True}, {"bsdf" : "kd"}, {"bsdf" : "ks"}, {"bsdf" : "normal"}]                     # Conf validation window/display. E.g. [{"relight" : <path to envlight>}]
+    FLAGS.background          = "white"                # Background color
+
+    # read bbox
+    o3d_mesh = o3d.t.io.read_triangle_mesh(FLAGS.bbox)
+    FLAGS.centre = o3d_mesh.get_center().numpy()
+    FLAGS.mesh_scale = (o3d_mesh.get_max_bound() - o3d_mesh.get_min_bound()).max().item() + 0.1
+    # bbox = np.loadtxt(FLAGS.bbox)
+    # FLAGS.mesh_scale = (bbox[3:] - bbox[:3]).max()
+    # FLAGS.mesh_scale = np.abs(bbox).max() / 0.5
+    print(f"Using mesh scale : {FLAGS.mesh_scale}")
+
+    # breakpoint()
     FLAGS.local_rank = 0
     FLAGS.multi_gpu  = "WORLD_SIZE" in os.environ and int(os.environ["WORLD_SIZE"]) > 1
     if FLAGS.multi_gpu:
@@ -542,7 +593,7 @@ if __name__ == "__main__":
     if FLAGS.out_dir is None:
         FLAGS.out_dir = 'out/cube_%d' % (FLAGS.train_res)
     else:
-        FLAGS.out_dir = 'out/' + FLAGS.out_dir
+        FLAGS.out_dir = 'out_lock/' + FLAGS.out_dir
 
     if FLAGS.local_rank == 0:
         print("Config / Flags:")
@@ -566,6 +617,8 @@ if __name__ == "__main__":
         if os.path.isfile(os.path.join(FLAGS.ref_mesh, 'poses_bounds.npy')):
             dataset_train    = DatasetLLFF(FLAGS.ref_mesh, FLAGS, examples=(FLAGS.iter+1)*FLAGS.batch)
             dataset_validate = DatasetLLFF(FLAGS.ref_mesh, FLAGS)
+            FLAGS.train_res = dataset_train.resolution
+            FLAGS.display_res = dataset_train.resolution
         elif os.path.isfile(os.path.join(FLAGS.ref_mesh, 'transforms_train.json')):
             dataset_train    = DatasetNERF(os.path.join(FLAGS.ref_mesh, 'transforms_train.json'), FLAGS, examples=(FLAGS.iter+1)*FLAGS.batch)
             dataset_validate = DatasetNERF(os.path.join(FLAGS.ref_mesh, 'transforms_test.json'), FLAGS)
@@ -578,6 +631,14 @@ if __name__ == "__main__":
         lgt = light.create_trainable_env_rnd(512, scale=0.0, bias=0.5)
     else:
         lgt = light.load_env(FLAGS.envmap, scale=FLAGS.env_scale)
+
+    val_envmaps = []
+    if FLAGS.envmap_dir is not None:
+        val_envmaps = sorted(glob.glob(os.path.join(FLAGS.envmap_dir, 'gt_env_512_rotated_*.hdr')))
+        print(val_envmaps)
+        # lgt_val = [light.load_env(ev) for ev in val_envmaps]
+        # print(lgt_val)
+
 
     if FLAGS.base_mesh is None:
         # ==============================================================================================
@@ -595,7 +656,7 @@ if __name__ == "__main__":
                         FLAGS, pass_idx=0, pass_name="dmtet_pass1", optimize_light=FLAGS.learn_light)
 
         if FLAGS.local_rank == 0 and FLAGS.validate:
-            validate(glctx, geometry, mat, lgt, dataset_validate, os.path.join(FLAGS.out_dir, "dmtet_validate"), FLAGS)
+            validate(glctx, geometry, mat, lgt, dataset_validate, os.path.join(FLAGS.out_dir, "dmtet_validate"), FLAGS, val_envmaps=val_envmaps)
 
         # Create textured mesh from result
         base_mesh = xatlas_uvmap(glctx, geometry, mat, FLAGS)
@@ -617,6 +678,7 @@ if __name__ == "__main__":
         # ==============================================================================================
         #  Pass 2: Train with fixed topology (mesh)
         # ==============================================================================================
+        FLAGS.lock_pos = True
         geometry, mat = optimize_mesh(glctx, geometry, base_mesh.material, lgt, dataset_train, dataset_validate, FLAGS, 
                     pass_idx=1, pass_name="mesh_pass", warmup_iter=100, optimize_light=FLAGS.learn_light and not FLAGS.lock_light, 
                     optimize_geometry=not FLAGS.lock_pos)
@@ -626,7 +688,39 @@ if __name__ == "__main__":
         # ==============================================================================================
 
         # Load initial guess mesh from file
-        base_mesh = mesh.load_mesh(FLAGS.base_mesh)
+        # base_mesh = mesh.load_mesh(FLAGS.base_mesh)
+        # import open3d as o3d
+        # o3d_mesh = o3d.io.read_triangle_mesh(FLAGS.base_mesh)
+        # print(o3d_mesh)
+        # o3d_mesh = o3d_mesh.remove_unreferenced_vertices()
+        # o3d_mesh = o3d_mesh.remove_degenerate_triangles()
+        # o3d_mesh = o3d_mesh.remove_non_manifold_edges()
+        # print(o3d_mesh)
+        # o3d_mesh = o3d.t.geometry.TriangleMesh.from_legacy(o3d_mesh)
+        # o3d_mesh.compute_uvatlas()
+        # breakpoint()
+        # import trimesh
+        # msh = trimesh.load_mesh(FLAGS.base_mesh)
+        # vertices = np.array(msh.vertices)
+        # vertices = torch.tensor(vertices, dtype=torch.float32, device='cuda')
+        # faces = np.array(msh.faces)
+        # faces = torch.tensor(faces, dtype=torch.int64, device='cuda')
+        # uvs, uv_idx = mesh.map_uv_new(faces, faces.shape[0])
+
+        # base_mesh = mesh.Mesh(vertices, faces, v_tex = uvs, t_tex_idx = uv_idx)
+
+        import open3d as o3d
+        o3d_mesh = o3d.io.read_triangle_mesh(FLAGS.base_mesh)
+        vertices = np.asarray(o3d_mesh.vertices)
+        vertices = torch.tensor(vertices, dtype=torch.float32, device='cuda')
+        faces = np.asarray(o3d_mesh.triangles)
+        faces = torch.tensor(faces, dtype=torch.int64, device='cuda')
+        uvs = torch.tensor(np.asarray(o3d_mesh.triangle_uvs), dtype=torch.float32, device='cuda')
+        uv_idx = torch.arange(uvs.shape[0], dtype=torch.long, device='cuda').reshape(-1, 3)
+
+        base_mesh = mesh.Mesh(vertices, faces, v_tex = uvs, t_tex_idx = uv_idx)
+
+
         geometry = DLMesh(base_mesh, FLAGS)
         
         mat = initial_guess_material(geometry, False, FLAGS, init_mat=base_mesh.material)
@@ -638,7 +732,11 @@ if __name__ == "__main__":
     #  Validate
     # ==============================================================================================
     if FLAGS.validate and FLAGS.local_rank == 0:
-        validate(glctx, geometry, mat, lgt, dataset_validate, os.path.join(FLAGS.out_dir, "validate"), FLAGS)
+        if len(val_envmaps) > 0:
+            FLAGS.nvs = False
+        validate(glctx, geometry, mat, lgt, dataset_validate, os.path.join(FLAGS.out_dir, "validate"), FLAGS, val_envmaps=val_envmaps)
+        FLAGS.nvs = True
+        validate(glctx, geometry, mat, lgt, dataset_validate, os.path.join(FLAGS.out_dir, "validate"), FLAGS, val_envmaps=val_envmaps)
 
     # ==============================================================================================
     #  Dump output

@@ -36,21 +36,25 @@ def to_hvec(x: torch.Tensor, w: float) -> torch.Tensor:
 # sRGB color transforms
 #----------------------------------------------------------------------------
 
-def _rgb_to_srgb(f: torch.Tensor) -> torch.Tensor:
-    return torch.where(f <= 0.0031308, f * 12.92, torch.pow(torch.clamp(f, 0.0031308), 1.0/2.4)*1.055 - 0.055)
+def _rgb_to_srgb(f: torch.Tensor, exp=0) -> torch.Tensor:
+    return torch.pow(f * np.power(2.0, 0), 1.0/2.2)
+    return torch.pow(f * np.power(2.0, exp), 1.0/2.2)
+    # return torch.where(f <= 0.0031308, f * 12.92, torch.pow(torch.clamp(f, 0.0031308), 1.0/2.4)*1.055 - 0.055)
 
-def rgb_to_srgb(f: torch.Tensor) -> torch.Tensor:
+def rgb_to_srgb(f: torch.Tensor, exp=0) -> torch.Tensor:
     assert f.shape[-1] == 3 or f.shape[-1] == 4
-    out = torch.cat((_rgb_to_srgb(f[..., 0:3]), f[..., 3:4]), dim=-1) if f.shape[-1] == 4 else _rgb_to_srgb(f)
+    out = torch.cat((_rgb_to_srgb(f[..., 0:3], exp), f[..., 3:4]), dim=-1) if f.shape[-1] == 4 else _rgb_to_srgb(f, exp)
     assert out.shape[0] == f.shape[0] and out.shape[1] == f.shape[1] and out.shape[2] == f.shape[2]
     return out
 
-def _srgb_to_rgb(f: torch.Tensor) -> torch.Tensor:
-    return torch.where(f <= 0.04045, f / 12.92, torch.pow((torch.clamp(f, 0.04045) + 0.055) / 1.055, 2.4))
+def _srgb_to_rgb(f: torch.Tensor, exp=0) -> torch.Tensor:
+    return torch.pow(f, 2.2) * np.power(2.0, 0)
+    return torch.pow(f, 2.2) * np.power(2.0, -exp)
+    # return torch.where(f <= 0.04045, f / 12.92, torch.pow((torch.clamp(f, 0.04045) + 0.055) / 1.055, 2.4))
 
-def srgb_to_rgb(f: torch.Tensor) -> torch.Tensor:
+def srgb_to_rgb(f: torch.Tensor, exp=0) -> torch.Tensor:
     assert f.shape[-1] == 3 or f.shape[-1] == 4
-    out = torch.cat((_srgb_to_rgb(f[..., 0:3]), f[..., 3:4]), dim=-1) if f.shape[-1] == 4 else _srgb_to_rgb(f)
+    out = torch.cat((_srgb_to_rgb(f[..., 0:3], exp), f[..., 3:4]), dim=-1) if f.shape[-1] == 4 else _srgb_to_rgb(f, exp)
     assert out.shape[0] == f.shape[0] and out.shape[1] == f.shape[1] and out.shape[2] == f.shape[2]
     return out
 
@@ -101,12 +105,18 @@ def cube_to_dir(s, x, y):
     return torch.stack((rx, ry, rz), dim=-1)
 
 def latlong_to_cubemap(latlong_map, res):
+    R = torch.zeros((3, 3), dtype=torch.float32, device='cuda')
+    R[0, 1] = -1
+    R[1, 2] = 1
+    R[2, 0] = -1
+
     cubemap = torch.zeros(6, res[0], res[1], latlong_map.shape[-1], dtype=torch.float32, device='cuda')
     for s in range(6):
         gy, gx = torch.meshgrid(torch.linspace(-1.0 + 1.0 / res[0], 1.0 - 1.0 / res[0], res[0], device='cuda'), 
                                 torch.linspace(-1.0 + 1.0 / res[1], 1.0 - 1.0 / res[1], res[1], device='cuda'),
                                 indexing='ij')
         v = safe_normalize(cube_to_dir(s, gx, gy))
+        v = (R @ v[..., None])[..., 0]
 
         tu = torch.atan2(v[..., 0:1], -v[..., 2:3]) / (2 * np.pi) + 0.5
         tv = torch.acos(torch.clamp(v[..., 1:2], min=-1, max=1)) / np.pi
@@ -180,8 +190,8 @@ def segment_sum(data: torch.Tensor, segment_ids: torch.Tensor) -> torch.Tensor:
 def fovx_to_fovy(fovx, aspect):
     return np.arctan(np.tan(fovx / 2) / aspect) * 2.0
 
-def focal_length_to_fovy(focal_length, sensor_height):
-    return 2 * np.arctan(0.5 * sensor_height / focal_length)
+def focal_length_to_fovy(focal_length, sensor_height, cy):
+    return 2 * np.arctan(cy / focal_length)
 
 # Reworked so this matches gluPerspective / glm::perspective, using fovy
 def perspective(fovy=0.7854, aspect=1.0, n=0.1, f=1000.0, device=None):

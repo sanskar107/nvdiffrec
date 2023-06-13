@@ -44,6 +44,7 @@ class EnvironmentLight(torch.nn.Module):
     LIGHT_MIN_RES = 16
 
     MIN_ROUGHNESS = 0.08
+    # MAX_ROUGHNESS = 0.92
     MAX_ROUGHNESS = 0.5
 
     def __init__(self, base):

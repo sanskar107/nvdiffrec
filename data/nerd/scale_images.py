@@ -9,29 +9,60 @@
 
 import os
 import glob
-import imageio
-import shutil
+import cv2
 
 import numpy as np
-import torch
+from tqdm import tqdm
 
-res = [512, 512]
+factor = 0.5
 
-datasets = ['ethiopianHead', 'moldGoldCape']
+datasets = ['antman', 'apple', 'chest', 'gamepad', 'ping_pong_racket', 'porcelain_mug', 'tpiece', 'wood_bowl']
+# datasets = ["scan37", "scan40", "scan55", "scan63", "scan65", "scan69", "scan83", "scan97"]
+
+
+datasets = ["/homes/sanskar/data/objrel/llff_data/" + dataset for dataset in datasets]
+# datasets = ["/homes/sanskar/data/bmvsdtu/llff_data/" + dataset for dataset in datasets]
 folders  = ['images', 'masks']
 
 for dataset in datasets:
-    dataset_rescaled = dataset + "_rescaled"
+    dataset_rescaled = "/homes/sanskar/data/nvdiffrec/input/" + dataset.split('/')[-1]
+    print(dataset_rescaled)
     os.makedirs(dataset_rescaled, exist_ok=True)
-    shutil.copyfile(os.path.join(dataset, "poses_bounds.npy"), os.path.join(dataset_rescaled, "poses_bounds.npy"))
     for folder in folders:
         os.makedirs(os.path.join(dataset_rescaled, folder), exist_ok=True)
-        files = glob.glob(os.path.join(dataset, folder, '*.jpg')) + glob.glob(os.path.join(dataset, folder, '*.JPG'))
-        for file in files:
-            print(file)
-            img = torch.tensor(imageio.imread(file).astype(np.float32) / 255.0)
-            img = img[None, ...].permute(0, 3, 1, 2)
-            rescaled_img = torch.nn.functional.interpolate(img, res, mode='area')
-            rescaled_img = rescaled_img.permute(0, 2, 3, 1)[0, ...]
+        files = glob.glob(os.path.join(dataset, folder, '*.png')) + glob.glob(os.path.join(dataset, folder, '*.PNG'))
+        for file in tqdm(files):
+            # print(file)
+            img = cv2.imread(file)
+            height, width = img.shape[:2]
+            new_width, new_height = int(width * factor), int(height * factor)
+            factor_x = new_width / width
+            factor_y = new_height / height
+            img = cv2.resize(img, (new_width, new_height), interpolation=cv2.INTER_AREA)
+            if len(img.shape) == 2:
+                img = img[..., None]
+                img = img.repeat(1, 1, 3)
             out_file = os.path.join(dataset_rescaled, folder, os.path.basename(file))
-            imageio.imwrite(out_file, np.clip(np.rint(rescaled_img.numpy() * 255.0), 0, 255).astype(np.uint8))
+            cv2.imwrite(out_file, img)
+
+    poses = np.load(os.path.join(dataset, "poses_bounds.npy"))
+    bds = poses[:, -2:]
+    poses = poses[:, :-2].reshape([-1, 3, 5])
+    poses[:, 0, 4] *= factor_x
+    poses[:, 1, 4] *= factor_y
+    poses[:, 2, 4] *= factor_x
+
+    poses = poses.reshape((-1, 15))
+    poses = np.concatenate([poses, bds], axis=1)
+    np.save(os.path.join(dataset_rescaled, "poses_bounds.npy"), poses)
+
+    poses = np.load(os.path.join(dataset, "val_poses_bounds.npy"))
+    bds = poses[:, -2:]
+    poses = poses[:, :-2].reshape([-1, 3, 5])
+    poses[:, 0, 4] *= factor_x
+    poses[:, 1, 4] *= factor_y
+    poses[:, 2, 4] *= factor_x
+
+    poses = poses.reshape((-1, 15))
+    poses = np.concatenate([poses, bds], axis=1)
+    np.save(os.path.join(dataset_rescaled, "val_poses_bounds.npy"), poses)

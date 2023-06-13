@@ -72,6 +72,30 @@ class Mesh:
             out.t_tng_idx = out.t_tng_idx.clone().detach()
         return out
 
+def map_uv_new(faces, max_idx):
+    # N = int(np.ceil(np.sqrt((max_idx+1)//2)))
+    N = int(np.ceil(np.sqrt(max_idx)))
+    tex_y, tex_x = torch.meshgrid(
+        torch.linspace(0, 1 - (1 / N), N, dtype=torch.float32, device="cuda"),
+        torch.linspace(0, 1 - (1 / N), N, dtype=torch.float32, device="cuda"),
+        indexing='ij'
+    )
+
+    pad = 0.9 / N
+
+    uvs = torch.stack([
+        tex_x      , tex_y,
+        tex_x + pad, tex_y,
+        tex_x + pad, tex_y + pad,
+        tex_x      , tex_y + pad
+    ], dim=-1).view(-1, 2)
+
+    face_idx = torch.arange(faces.shape[0], dtype=torch.long, device="cuda")
+    uv_idx = torch.stack((face_idx * 4, face_idx * 4 + 1, face_idx * 4 + 2), dim = -1).view(-1, 3)
+
+    return uvs, uv_idx
+
+
 ######################################################################################
 # Mesh loeading helper
 ######################################################################################
