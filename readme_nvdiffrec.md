@@ -1,6 +1,6 @@
 # nvdiffrec Experiments for "ERROR: Evaluation of Reconstruction and Rendering for Object Relighting"
 
-Please, find the modified code base at: https://anonymous.4open.science/r/Neural-PIL-C744/README.md
+Please, find the modified code base at: https://anonymous.4open.science/r/nvdiffrec-E83C/README.md
 
 ## Dataset
 
